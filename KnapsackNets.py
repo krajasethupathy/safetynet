@@ -17,8 +17,8 @@ import math
 
 
 
-from qpth.qp import QPFunction
-from qpth.qpJK import QPFunctionJK
+from qpth.qp import QPFunction as QPFunctionJK
+#from qpth.qpJK import QPFunctionJK
 #from qpth.lpJK import LPFunction
 from qpth.util import bger, expandParam, extract_nBatch
 from enum import Enum
@@ -258,7 +258,7 @@ def normalize_cXt_to_bXt(CategoryXt,bXCategory):
     return torch.mm(bXCategory,normed)
 
 def normalize_JK(matrix, dim=1):
-    normed= torch.div(matrix,torch.sum(matrix,dim=dim).expand_as(matrix))
+    normed= torch.div(matrix,torch.sum(matrix,dim=dim).unsqueeze(1).expand_as(matrix))
     return normed
 
 def cancel_rate_belief_cXt(cancel_coefs,cancel_intercepts,thresholds_matrix):
@@ -322,7 +322,7 @@ class SafetyNet(nn.Module):
         else:
             #self.thresholds_raw_matrix = Parameter(torch.ones(self.nKnapsackCategories,self.nThresholds)*(1.0/self.nThresholds))
             self.thresholds_raw_matrix = Parameter(starting_thresholds)
-        self.thresholds_raw_matrix_norm= torch.div(self.thresholds_raw_matrix,torch.sum(self.thresholds_raw_matrix,dim=1).expand_as(self.thresholds_raw_matrix))
+        self.thresholds_raw_matrix_norm= torch.div(self.thresholds_raw_matrix,torch.sum(self.thresholds_raw_matrix,dim=1).unsqueeze(1).expand_as(self.thresholds_raw_matrix))
 
         #Inventory distribution parameters
         self.inventory_lam_opt = Parameter(torch.ones(self.nKnapsackCategories)*inventory_initializer)
@@ -357,11 +357,11 @@ class SafetyNet(nn.Module):
 
         #We want to compute everything we can without thresholds first. This will allow us to use our learned parameters to feed the LP
         self.inventory_distribution_raw_est = PoissonFunction(self.nKnapsackCategories,self.nThresholds,verbose=-1)(self.inventory_lam_est,self.thresholds)+self.eps
-        self.inventory_distribution_norm_est = normalize_JK(self.inventory_distribution_raw_est,dim=1)
+        #self.inventory_distribution_norm_est = normalize_JK(self.inventory_distribution_raw_est,dim=1)
         self.inventory_distribution_batch_by_threshold_est = torch.mm(category,self.inventory_distribution_raw_est)+self.eps
 
         self.inventory_distribution_raw_opt = PoissonFunction(self.nKnapsackCategories,self.nThresholds,verbose=-1)(self.inventory_lam_opt,self.thresholds)+self.eps
-        self.inventory_distribution_norm_opt = normalize_JK(self.inventory_distribution_raw_opt,dim=1)
+        #self.inventory_distribution_norm_opt = normalize_JK(self.inventory_distribution_raw_opt,dim=1)
         self.inventory_distribution_batch_by_threshold_opt = torch.mm(category,self.inventory_distribution_raw_opt)+self.eps
 
 
@@ -424,6 +424,10 @@ class SafetyNet(nn.Module):
 
 
         #new to v37
+        print(reject_percent_collection_b_vector)
+        print(reject_percent_collection_b_vector.size())
+        print(self.nBatch)
+        print(self.nThresholds)
         reject_percent_collection_expanded_bXt= reject_percent_collection_b_vector.unsqueeze(1).expand(self.nBatch,self.nThresholds)
         self.truncated_orders_distribution_bXt = torch.div(reject_probability_collection_bXt*self.inventory_distribution_batch_by_threshold_est,reject_percent_collection_expanded_bXt+self.eps)
         truncated_demand_b_vector = self.batch_total_demand_b_vector-1     #self.belief_total_demand_cXt
@@ -439,7 +443,8 @@ class SafetyNet(nn.Module):
         accept_probability_batch_by_threshold = CumSumNoGrad(verbose=-1)(collection_thresholds)+self.eps
         self.inventory_distribution_batch_by_thresholds = torch.mm(category,self.inventory_distribution_raw_est)
         arrival_probability_batch_by_threshold_unnormed = self.inventory_distribution_batch_by_thresholds*accept_probability_batch_by_threshold
-        arrival_probability_batch_by_threshold = torch.div(arrival_probability_batch_by_threshold_unnormed,torch.sum(arrival_probability_batch_by_threshold_unnormed,dim=1).expand_as(arrival_probability_batch_by_threshold_unnormed))
+        print(arrival_probability_batch_by_threshold_unnormed.size())        
+        arrival_probability_batch_by_threshold = torch.div(arrival_probability_batch_by_threshold_unnormed,torch.sum(arrival_probability_batch_by_threshold_unnormed,dim=1).unsqueeze(1).expand_as(arrival_probability_batch_by_threshold_unnormed)) # TODO: add unsqueeze to make this work
         log_arrival_prob = torch.log(arrival_probability_batch_by_threshold+self.eps)
 
         #Like we do for inventory, we want to measure the accuracy of our cancel params for the batch
@@ -589,11 +594,11 @@ class SafetyNet_v46(nn.Module):
 
         #We want to compute everything we can without thresholds first. This will allow us to use our learned parameters to feed the LP
         self.inventory_distribution_raw_est = PoissonFunction(self.nKnapsackCategories,self.nThresholds,verbose=-1)(self.inventory_lam_est,self.thresholds)+self.eps
-        self.inventory_distribution_norm_est = normalize_JK(self.inventory_distribution_raw_est,dim=1)
+        #self.inventory_distribution_norm_est = normalize_JK(self.inventory_distribution_raw_est,dim=1)
         self.inventory_distribution_batch_by_threshold_est = torch.mm(category,self.inventory_distribution_raw_est)+self.eps
 
         self.inventory_distribution_raw_opt = PoissonFunction(self.nKnapsackCategories,self.nThresholds,verbose=-1)(self.inventory_lam_opt,self.thresholds)+self.eps
-        self.inventory_distribution_norm_opt = normalize_JK(self.inventory_distribution_raw_opt,dim=1)
+        #self.inventory_distribution_norm_opt = normalize_JK(self.inventory_distribution_raw_opt,dim=1)
         self.inventory_distribution_batch_by_threshold_opt = torch.mm(category,self.inventory_distribution_raw_opt)+self.eps
 
 
