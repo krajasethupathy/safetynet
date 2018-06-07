@@ -1,277 +1,3 @@
-__author__ = 'jeremykarp'
-import copy
-import torch
-import numpy as np
-import torch.nn as nn
-from torch.autograd import Function, Variable
-from torch.nn.parameter import Parameter
-import torch.nn.functional as F
-import pandas as pd
-import datetime as dt
-import random
-import scipy.stats as s
-from sklearn.linear_model import LogisticRegression
-import math
-
-#from gurobipy import *
-
-
-
-from qpth.qp import QPFunction as QPFunctionJK
-#from qpth.qpJK import QPFunctionJK
-#from qpth.lpJK import LPFunction
-from qpth.util import bger, expandParam, extract_nBatch
-from enum import Enum
-
-
-class QPSolvers(Enum):
-    PDIPM_BATCHED = 1
-    CVXPY = 2
-
-class KnapsackFunction(Function):
-    def __init__(self, verbose=False):
-        self.verbose = verbose
-    def forward(self, r_,thresholds):
-        ones_vector = torch.ones(torch.numel(thresholds))
-        inverse_thresholds = torch.div(ones_vector,thresholds)
-        r_coefficients = torch.ger(r_,inverse_thresholds)
-        r_coefficients_1d = r_coefficients.view(-1)
-        self.r_coefficients=r_coefficients
-        self.inverse_thresholds = inverse_thresholds
-        self.save_for_backward(r_,r_coefficients_1d)
-        return r_coefficients_1d
-    def backward(self, grad_output):
-        grad_r = grad_thresholds = None
-        r_,r_coefficients_1d= self.saved_tensors
-        grad_output_matrix = grad_output.view(torch.numel(r_),-1)
-        grad_r = grad_output_matrix.mv(self.inverse_thresholds)
-        return grad_r, grad_thresholds
-
-class KnapsackExponentialFunction(Function):
-    def __init__(self,nKnapsackCategories,nThresholds, verbose=False):
-        self.verbose = verbose
-        self.nKnapsackCategories = nKnapsackCategories
-        self.nThresholds = nThresholds
-    def forward(self, scale,lam,thresholds):
-        scale_lam = scale*lam
-        scale_lam_matrix = torch.ger(scale_lam,torch.ones(self.nThresholds))
-        self.lam_thresh_matrix = torch.ger(lam,thresholds)
-        self.exp_lam_thresh_matrix = torch.exp(-1*self.lam_thresh_matrix)
-        self.exp_output_matrix = scale_lam_matrix*self.exp_lam_thresh_matrix
-        self.exp_output_matrix_1d = self.exp_output_matrix.view(-1)
-        self.save_for_backward(scale,lam,thresholds)
-        return self.exp_output_matrix_1d
-    def backward(self, grad_output):
-        grad_scale = grad_lam = grad_thresholds = None
-        scale,lam,thresholds= self.saved_tensors
-        grad_output_matrix = grad_output.view(self.nKnapsackCategories,-1)
-        #partial derivative matrix w/r/t scale = lam*exp(-lam*x)
-        lam_matrix = torch.ger(lam, torch.ones(self.nThresholds))
-        grad_scale = torch.sum(lam_matrix*self.exp_lam_thresh_matrix*grad_output_matrix,dim=1).squeeze()
-        scale_matrix = torch.ger(scale,torch.ones(self.nThresholds))
-        grad_lam = torch.sum(scale_matrix*(-1*self.lam_thresh_matrix+1)*self.exp_lam_thresh_matrix*grad_output_matrix,dim=1).squeeze()
-        return grad_scale,grad_lam, grad_thresholds
-
-
-class KnapsackExponentialSpreadFunction(Function):
-    def __init__(self,nKnapsackCategories,nThresholds, verbose=False):
-        self.verbose = verbose
-        self.nKnapsackCategories = nKnapsackCategories
-        self.nThresholds = nThresholds
-    def forward(self, scale,spread,lam,thresholds):
-        scale_lam = scale*lam
-        scale_lam_matrix = torch.ger(scale_lam,torch.ones(self.nThresholds))
-        self.lam_spread_thresh_matrix = torch.ger(lam*spread,thresholds)
-        self.exp_lam_spread_thresh_matrix = torch.exp(-1*self.lam_spread_thresh_matrix)
-        self.exp_output_matrix = scale_lam_matrix*self.exp_lam_spread_thresh_matrix
-        self.exp_output_matrix_1d = self.exp_output_matrix.view(-1)
-        self.save_for_backward(scale,spread,lam,thresholds)
-        return self.exp_output_matrix_1d
-    def backward(self, grad_output):
-        grad_scale = grad_spread = grad_lam = grad_thresholds = None
-        scale,spread,lam,thresholds= self.saved_tensors
-        grad_output_matrix = grad_output.view(self.nKnapsackCategories,-1)
-        #partial derivative matrix w/r/t scale = lam*exp(-lam*x)
-        lam_matrix = torch.ger(lam, torch.ones(self.nThresholds))
-        grad_scale = torch.sum(lam_matrix*self.exp_lam_spread_thresh_matrix*grad_output_matrix,dim=1).squeeze()
-        #partial derivative w/r/t spread = -a*(lambda^2)*x*exp(-b*lambda*x)
-        lam_sq_matrix = torch.pow(lam_matrix,2)
-        scale_matrix = torch.ger(scale,torch.ones(self.nThresholds))
-        threshold_matrix = torch.ger(torch.ones(self.nKnapsackCategories),thresholds)
-        grad_spread = torch.sum(-1*scale_matrix*lam_sq_matrix*threshold_matrix*self.exp_lam_spread_thresh_matrix*grad_output_matrix,dim=1).squeeze()
-        grad_lam = torch.sum(scale_matrix*(-1*self.lam_spread_thresh_matrix+1)*self.exp_lam_spread_thresh_matrix*grad_output_matrix,dim=1).squeeze()
-        return grad_scale,grad_spread,grad_lam, grad_thresholds
-
-class KnapsackWeibullFunction(Function):
-    def __init__(self,nKnapsackCategories,nThresholds, verbose=False):
-        self.verbose = verbose
-        self.nKnapsackCategories = nKnapsackCategories
-        self.nThresholds = nThresholds
-    def forward(self, lam,k,thresholds):
-        k_div_lam = torch.div(k,lam)
-        k_div_lam_matrix = torch.ger(k_div_lam,torch.ones(self.nThresholds))
-        lam_inverse = torch.div(torch.ones(self.nKnapsackCategories),lam)
-        self.lam_inverse = lam_inverse
-        k_minus = k-1
-        lam_inverse_pow_k_minus = torch.pow(lam_inverse,k_minus)
-        lam_inverse_pow_k_minus_matrix = torch.ger(lam_inverse_pow_k_minus, torch.ones(self.nThresholds))
-        self.thresholds_matrix = torch.ger(torch.ones(self.nKnapsackCategories),thresholds)
-        k_matrix = torch.ger(k,torch.ones(self.nThresholds))
-        x_pow_k_minus = torch.pow(self.thresholds_matrix,k_matrix-1)
-        self.x_div_lam_pow_k_minus = torch.div(x_pow_k_minus,lam_inverse_pow_k_minus_matrix)
-        #computing now for backward pass
-        x_pow_k = torch.pow(self.thresholds_matrix,k_matrix)
-        lam_inverse_pow_k = torch.pow(lam_inverse,k)
-        lam_inverse_pow_k_matrix = torch.ger(lam_inverse_pow_k, torch.ones(self.nThresholds))
-        self.x_div_lam_pow_k = torch.div(x_pow_k,lam_inverse_pow_k_matrix)
-        #back to forward pass
-        x_pow_k = torch.pow(self.thresholds_matrix,k_matrix-1)
-        lam_inverse_pow_k = torch.pow(lam_inverse,k)
-        lam_inverse_pow_k_matrix = torch.ger(lam_inverse_pow_k,torch.ones(self.nThresholds))
-        negative_x_div_lam_pow_k = -1*torch.div(x_pow_k,lam_inverse_pow_k_matrix)
-        self.exp_matrix = torch.exp(negative_x_div_lam_pow_k)
-        self.weibull_pdf = k_div_lam_matrix*self.x_div_lam_pow_k_minus*self.exp_matrix
-        self.weibull_pdf_1d = self.weibull_pdf.view(-1)
-        self.save_for_backward(lam,k,thresholds)
-        return self.weibull_pdf_1d
-    def backward(self, grad_output):
-        lam,k,thresholds = self.saved_tensors
-        grad_lam = grad_k = grad_thresholds = None
-        #first we'll compute partial derivative of f(x;lam,k) w/r/t lambda = ((k/lam)^2)(exp(-(x/lam)^k))((x/lam)^(k-1))(((x/lam)^k)-1)
-        k_div_lam_squared = torch.pow(torch.div(k,lam),2)
-        k_div_lam_squared_matrix = torch.ger(k_div_lam_squared,torch.ones(self.nThresholds))
-        #exponential matrix is saved from forward pass as self.exp_matrix
-        #((x/lam)^(k-1)) is saved from forward pass as self.x_div_lam_pow_k_minus
-        x_div_lam_pow_k_sub_one = self.x_div_lam_pow_k-1
-        partial_lam = k_div_lam_squared_matrix*self.exp_matrix*self.x_div_lam_pow_k_minus*x_div_lam_pow_k_sub_one
-        #next we'll compute partial derivative of f(x;lam,k) w/r/t k = a long product divided by x
-        #First term in product is (exp(-(x/lam)^k)) aka self.exp_matrix
-        #Second term in product is ((x/lam)^k) aka self.x_div_lam_pow_k
-        #Third is (1-k(((x/lam)^k)-1)log(x/lam))
-        #Divide that product by x
-        #We will compute the product and then divide that matrix by self.thresholds_matrix with torch.div()
-        lam_inverse_matrix = torch.ger(self.lam_inverse, torch.ones(self.nThresholds))
-        log_x_div_lam = torch.log(torch.div(self.thresholds_matrix,lam_inverse_matrix))
-        ones_matrix = torch.ones(self.nKnapsackCategories,self.nThresholds)
-        k_matrix = torch.ger(k,torch.ones(self.nThresholds))
-        product_term3=ones_matrix-(k_matrix*x_div_lam_pow_k_sub_one*log_x_div_lam)
-        partial_k = torch.div(self.exp_matrix*self.x_div_lam_pow_k*product_term3,self.thresholds_matrix)
-        grad_output_matrix = grad_output.view(self.nKnapsackCategories,-1)
-        grad_lam = torch.sum(partial_lam*grad_output_matrix,dim=1).squeeze()
-        grad_k = torch.sum(partial_k*grad_output_matrix,dim=1).squeeze()
-        return grad_lam, grad_k, grad_thresholds
-
-
-class FactorialFunction(Function):
-    def __init__(self,nThresholds,verbose=False):
-        self.verbose = verbose
-        self.nThresholds =nThresholds
-    def forward(self, vec):
-        self.vec_factorial = torch.ones(self.nThresholds)
-        for i in range(torch.numel(vec-1)):
-            self.vec_factorial = self.vec_factorial*(vec-i).clamp(min=1)
-        return self.vec_factorial
-    def backward(self, grad_output):
-        grad_vec = None
-        return grad_vec
-
-def FactorialFunctionPlain(nThresholds, vec):
-    vec_factorial = torch.ones(nThresholds)
-    for i in range(torch.numel(vec-1)):
-        vec_factorial = vec_factorial*(vec-i).clamp(min=1)
-    return vec_factorial
-
-def LamToverTFactorial_orig(nKnapsackCategories,nThresholds,t_vector,lam_vector):
-    soln_matrix = torch.ones(nKnapsackCategories,nThresholds)
-    lam_matrix = torch.ger(lam_vector, torch.ones(nThresholds))
-    onesCategories = torch.ones(nKnapsackCategories)
-    t_matrix = torch.ger(torch.ones(nKnapsackCategories),t_vector)
-    for i in range(nThresholds):
-        soln_matrix = torch.div(soln_matrix*lam_matrix,(t_matrix-i).clamp(min=1))
-        lam_matrix = lam_matrix.t()
-        lam_matrix[i]=onesCategories
-        lam_matrix = lam_matrix.t()
-    return soln_matrix
-
-
-def LamToverTFactorial(nKnapsackCategories,nThresholds,t_vector,lam_vector):
-    soln_matrix = torch.ones(nKnapsackCategories,nThresholds)
-    lam_matrix = torch.ger(lam_vector, torch.ones(nThresholds))
-    onesCategories = torch.ones(nKnapsackCategories)
-    t_matrix = torch.ger(torch.ones(nKnapsackCategories),t_vector)
-    for i in range(nThresholds):
-        lam_matrix = lam_matrix.t()
-        lam_matrix[i]=onesCategories
-        lam_matrix = lam_matrix.t()
-        soln_matrix = torch.div(soln_matrix*lam_matrix,(t_matrix-i).clamp(min=1))
-    return soln_matrix
-
-
-class PoissonFunction(Function):
-    def __init__(self,nKnapsackCategories,nThresholds, verbose=False):
-        self.verbose = verbose
-        self.nKnapsackCategories = nKnapsackCategories
-        self.nThresholds = nThresholds
-    def forward(self, lam, thresholds):
-        self.poisson_dist = None
-        self.lam_matrix = torch.ger(lam,torch.ones(self.nThresholds))
-        self.t_matrix = torch.ger(torch.ones(self.nKnapsackCategories),thresholds)
-        self.lam_pow_t_div_t_factorial = LamToverTFactorial(self.nKnapsackCategories,self.nThresholds,thresholds,lam)
-        #lam_pow_t_matrix = torch.pow(self.lam_matrix,self.t_matrix)
-        self.exp_lam_matrix = torch.exp(-1*self.lam_matrix)
-        #t_factorial = FactorialFunctionPlain(self.nThresholds,thresholds)
-        #self.t_factorial_matrix = torch.ger(torch.ones(self.nKnapsackCategories),t_factorial)
-        #print("PoissonFunction t_factorial_matrix",self.t_factorial_matrix)
-        self.poisson_dist = self.lam_pow_t_div_t_factorial*self.exp_lam_matrix
-        #print("PoissonFunction lam_pow_t_div_t_factorial",self.lam_pow_t_div_t_factorial)
-        #print("PoissonFunction exp_lam_matrix",self.exp_lam_matrix)
-        #print("PoissonFunction poisson_dist",self.poisson_dist)
-        self.save_for_backward(lam)
-        return self.poisson_dist
-    def backward(self, grad_output):
-        #print("PoissonFunction grad_output", grad_output)
-        grad_lam = grad_thresholds = None
-        #lam_t_minus_one_matrix = torch.pow(self.lam_matrix,self.t_matrix-1)
-        lam_pow_t_minus_one_div_t_factorial = torch.div(self.lam_pow_t_div_t_factorial,self.lam_matrix)
-        t_minus_lam_matrix = self.t_matrix-self.lam_matrix
-        #print("PoissonFunction exp_lam_matrix",self.exp_lam_matrix)
-        #print("PoissonFunction lam_pow_t_minus_one_div_t_factorial", lam_pow_t_minus_one_div_t_factorial)
-        dp_dlam = self.exp_lam_matrix*lam_pow_t_minus_one_div_t_factorial*t_minus_lam_matrix
-        #print("PoissonFunction dp_dlam", dp_dlam)
-        grad_lam = torch.sum(grad_output*dp_dlam,dim=1).squeeze()
-        #print("PoissonFunction grad_lam", grad_lam)
-        return grad_lam, grad_thresholds
-
-
-class CumSumNoGrad(Function):
-    def __init__(self,verbose=False):
-        self.verbose = verbose
-    def forward(self, tensor_):
-        return torch.cumsum(tensor_,dim=1)
-    def backward(self, grad_output):
-        grad_tensor = None
-        return grad_tensor
-
-
-def normalize_cXt_to_bXt(CategoryXt,bXCategory):
-    normed= torch.div(CategoryXt,torch.sum(CategoryXt,dim=1).expand_as(CategoryXt))
-    return torch.mm(bXCategory,normed)
-
-def normalize_JK(matrix, dim=1):
-    normed= torch.div(matrix,torch.sum(matrix,dim=dim).unsqueeze(1).expand_as(matrix))
-    return normed
-
-def cancel_rate_belief_cXt(cancel_coefs,cancel_intercepts,thresholds_matrix):
-    #1-(1/(1+math.exp(cancel_intercept+x*cancel_coef)
-    cancel_intercepts_matrix = cancel_intercepts.unsqueeze(1).expand_as(thresholds_matrix)
-    cancel_coefs_matrix = cancel_coefs.unsqueeze(1).expand_as(thresholds_matrix)
-    intercept_plus_thresh_times_coef = cancel_intercepts_matrix+(thresholds_matrix*cancel_coefs_matrix)
-    exp_matrix = torch.exp(intercept_plus_thresh_times_coef)
-    cancel_rate_belief = 1-(1/(1+exp_matrix))
-    return cancel_rate_belief
-
-
-
 class SafetyNet(nn.Module):
     def __init__(self, nKnapsackCategories, nThresholds, starting_thresholds, nineq=1, neq=0, eps=1e-8, cancel_rate_target=.05, cancel_rate_evaluation=.05, accept_rate_target=.75, accept_rate_evaluation=.75,
                  cancel_initializer=.02,inventory_initializer=3,cancel_coef_initializer=-.2,
@@ -322,7 +48,7 @@ class SafetyNet(nn.Module):
         else:
             #self.thresholds_raw_matrix = Parameter(torch.ones(self.nKnapsackCategories,self.nThresholds)*(1.0/self.nThresholds))
             self.thresholds_raw_matrix = Parameter(starting_thresholds)
-        self.thresholds_raw_matrix_norm= torch.div(self.thresholds_raw_matrix,torch.sum(self.thresholds_raw_matrix,dim=1).unsqueeze(1).expand_as(self.thresholds_raw_matrix))
+        self.thresholds_raw_matrix_norm= torch.div(self.thresholds_raw_matrix,torch.sum(self.thresholds_raw_matrix,dim=1).expand_as(self.thresholds_raw_matrix))
 
         #Inventory distribution parameters
         self.inventory_lam_opt = Parameter(torch.ones(self.nKnapsackCategories)*inventory_initializer)
@@ -357,11 +83,11 @@ class SafetyNet(nn.Module):
 
         #We want to compute everything we can without thresholds first. This will allow us to use our learned parameters to feed the LP
         self.inventory_distribution_raw_est = PoissonFunction(self.nKnapsackCategories,self.nThresholds,verbose=-1)(self.inventory_lam_est,self.thresholds)+self.eps
-        #self.inventory_distribution_norm_est = normalize_JK(self.inventory_distribution_raw_est,dim=1)
+        self.inventory_distribution_norm_est = normalize_JK(self.inventory_distribution_raw_est,dim=1)
         self.inventory_distribution_batch_by_threshold_est = torch.mm(category,self.inventory_distribution_raw_est)+self.eps
 
         self.inventory_distribution_raw_opt = PoissonFunction(self.nKnapsackCategories,self.nThresholds,verbose=-1)(self.inventory_lam_opt,self.thresholds)+self.eps
-        #self.inventory_distribution_norm_opt = normalize_JK(self.inventory_distribution_raw_opt,dim=1)
+        self.inventory_distribution_norm_opt = normalize_JK(self.inventory_distribution_raw_opt,dim=1)
         self.inventory_distribution_batch_by_threshold_opt = torch.mm(category,self.inventory_distribution_raw_opt)+self.eps
 
 
@@ -439,7 +165,7 @@ class SafetyNet(nn.Module):
         accept_probability_batch_by_threshold = CumSumNoGrad(verbose=-1)(collection_thresholds)+self.eps
         self.inventory_distribution_batch_by_thresholds = torch.mm(category,self.inventory_distribution_raw_est)
         arrival_probability_batch_by_threshold_unnormed = self.inventory_distribution_batch_by_thresholds*accept_probability_batch_by_threshold
-        arrival_probability_batch_by_threshold = torch.div(arrival_probability_batch_by_threshold_unnormed,torch.sum(arrival_probability_batch_by_threshold_unnormed,dim=1).unsqueeze(1).expand_as(arrival_probability_batch_by_threshold_unnormed))
+        arrival_probability_batch_by_threshold = torch.div(arrival_probability_batch_by_threshold_unnormed,torch.sum(arrival_probability_batch_by_threshold_unnormed,dim=1).expand_as(arrival_probability_batch_by_threshold_unnormed))
         log_arrival_prob = torch.log(arrival_probability_batch_by_threshold+self.eps)
 
         #Like we do for inventory, we want to measure the accuracy of our cancel params for the batch
@@ -491,11 +217,3 @@ class SafetyNet(nn.Module):
         observed_accept_constraint_loss = (1.0/7.0)*(self.batch_accept_sum*self.accept_rate_evaluation-self.batch_fill_sum)
 
         return new_objective_loss, new_cancel_constraint_loss, new_accept_constraint_loss, arrival_probability_batch_by_threshold, log_arrival_prob, log_cancel_prob, log_category_prob, self.estimated_batch_total_demand, observed_cancel_constraint_loss, observed_accept_constraint_loss, self.lp_infeasible
-
-def ExpFunction(scale,lam,thresholds,C,T):
-    scale_lam = scale*lam
-    scale_lam_matrix = scale_lam.unsqueeze(1).expand(C,T)
-    lam_thresh_matrix = torch.ger(lam,thresholds)
-    exp_lam_thresh_matrix = torch.exp(-1*lam_thresh_matrix)
-    exp_output_matrix = scale_lam_matrix*exp_lam_thresh_matrix
-    return exp_output_matrix
